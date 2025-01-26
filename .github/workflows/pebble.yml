@@ -1,0 +1,26 @@
+name: Pebble
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+  schedule:
+    - cron: "25 6 * * 5"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download Pebble
+        run: |
+          curl -L "https://github.com/letsencrypt/pebble/releases/latest/download/pebble-linux-amd64.tar.gz" |\
+          tar xz --strip-components=4
+      - name: Download Pebble Challenge Test Server
+        run: |
+          curl -L "https://github.com/letsencrypt/pebble/releases/latest/download/pebble-challtestsrv-linux-amd64.tar.gz" |\
+          tar xz --strip-components=4
+      - name: Run integration test
+        run: cargo test --test integration
