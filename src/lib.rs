@@ -168,6 +168,56 @@ impl Order {
         self.account.get(&mut self.nonce, challenge_url).await
     }
 
+    /// Deactivate the order's pending or valid authorizations
+    ///
+    /// Returns the updated status of the order post-deactivation.
+    ///
+    /// This is useful when you want to cancel a pending order you wish to abandon, or to revoke
+    /// valid authorizations for the order's identifiers to prevent reuse.
+    ///
+    /// Once deactivated the order and associated resources (authorizations, challenges, etc) can
+    /// not be updated further.
+    pub async fn deactivate(&mut self) -> Result<&OrderState, Error> {
+        #[derive(Serialize)]
+        struct DeactivateRequest<'a> {
+            status: &'a str,
+        }
+
+        for authz_url in &self.state.authorizations {
+            let authz = self
+                .account
+                .get::<Authorization>(&mut self.nonce, authz_url)
+                .await?;
+            // Authorizations in other terminal states (e.g. Invalid, Expired, etc) should not be
+            // deactivated.
+            if authz.status != AuthorizationStatus::Pending
+                && authz.status != AuthorizationStatus::Valid
+            {
+                continue;
+            }
+
+            let rsp = self
+                .account
+                .post(
+                    Some(&DeactivateRequest {
+                        status: "deactivated",
+                    }),
+                    None,
+                    authz_url,
+                )
+                .await?;
+
+            let authz = Problem::check::<Authorization>(rsp).await?;
+            if authz.status != AuthorizationStatus::Deactivated {
+                return Err(Error::Other(
+                    format!("authorization {authz_url} was not deactivated").into(),
+                ));
+            }
+        }
+
+        self.refresh().await
+    }
+
     /// Poll the order with exponential backoff until in a final state
     ///
     /// Refresh the order state from the server for `tries` times, waiting `delay` before the
