@@ -230,6 +230,40 @@ async fn replacement_order() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
+/// Test that it is possible to deactivate an order's authorizations
+#[tokio::test]
+#[ignore]
+async fn order_deactivate() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    let env = Environment::new(EnvironmentConfig::default()).await?;
+
+    let idents = dns_identifiers(["authz-deactivate.example.com"]);
+    let new_order = &NewOrder::new(&idents);
+    let mut order = env.account.new_order(new_order).await?;
+
+    // Each of the order's authorizations should start pending.
+    for authz in order.authorizations().await? {
+        assert_eq!(authz.status, AuthorizationStatus::Pending);
+    }
+
+    // With all authz's deactivated, the order should be status == Invalid
+    // However, until https://github.com/letsencrypt/pebble/pull/301 is merged Pebble returns
+    // an unspecified "deactivated" state we reject as a JSON decoding error about an unexpected
+    // status.
+    // TODO(@cpu): when Pebble is fixed, replace with an assertion on order status.
+    let err = order.deactivate().await.unwrap_err();
+    assert!(matches!(err, Error::Json(_)));
+    assert!(err.to_string().contains("deactivated"));
+
+    // Each of the order's authorizations should be deactivated.
+    for authz in order.authorizations().await? {
+        assert_eq!(authz.status, AuthorizationStatus::Deactivated);
+    }
+
+    Ok(())
+}
+
 fn try_tracing_init() {
     let _ = tracing_subscriber::registry()
         .with(fmt::layer())
