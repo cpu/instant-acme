@@ -552,6 +552,7 @@ pub enum AuthorizationStatus {
     Invalid,
     Revoked,
     Expired,
+    Deactivated,
 }
 
 /// Represent an identifier in an ACME [Order](crate::Order)
