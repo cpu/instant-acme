@@ -544,7 +544,7 @@ pub struct AuthorizationState {
 
 /// Status for an [`AuthorizationState`]
 #[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum AuthorizationStatus {
     Pending,
