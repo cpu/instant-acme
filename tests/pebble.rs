@@ -405,11 +405,10 @@ async fn account_from_key() -> Result<(), Box<dyn StdError>> {
     let json1 = serde_json::to_string(&credentials)?;
     let json_key = serde_json::from_str::<JsonKey>(&json1)?;
     let key_der = BASE64_URL_SAFE_NO_PAD.decode(json_key.key_pkcs8)?;
-    let key = Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(key_der.clone()))?;
 
     let (account2, credentials2) = Account::builder_with_http(Box::new(env.client.clone()))
         .from_key(
-            (key, PrivateKeyDer::try_from(key_der.clone())?),
+            PrivateKeyDer::try_from(PrivatePkcs8KeyDer::from(key_der.clone()))?,
             directory_url,
         )
         .await?;
@@ -425,9 +424,8 @@ async fn account_from_key() -> Result<(), Box<dyn StdError>> {
     let env = Environment::new(EnvironmentConfig::default()).await?;
     let directory_url = format!("https://{}/dir", &env.config.pebble.listen_address);
 
-    let key = Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(key_der.clone()))?;
     let result = Account::builder_with_http(Box::new(env.client.clone()))
-        .from_key((key, PrivateKeyDer::try_from(key_der)?), directory_url)
+        .from_key(PrivateKeyDer::try_from(PrivatePkcs8KeyDer::from(key_der))?, directory_url)
         .await;
 
     let Err(err) = result else {
@@ -456,15 +454,12 @@ async fn account_create_from_key() -> Result<(), Box<dyn StdError>> {
     let directory_url = format!("https://{}/dir", &env.config.pebble.listen_address);
 
     // Generate a new key
-    let (key, key_pkcs8) = Key::generate_pkcs8()?;
+    let (_, key_pkcs8) = Key::generate_pkcs8()?;
 
     // Create a new account with the generated key
     let (account1, credentials1) = Account::builder_with_http(Box::new(env.client.clone()))
         .create_from_key(
-            (
-                key,
                 PrivateKeyDer::try_from(key_pkcs8.secret_pkcs8_der().to_vec())?,
-            ),
             directory_url.clone(),
         )
         .await?;
@@ -483,9 +478,8 @@ async fn account_create_from_key() -> Result<(), Box<dyn StdError>> {
     assert_eq!(key_der, key_pkcs8.secret_pkcs8_der());
 
     // Now try to load the account using from_key to verify it was created
-    let key2 = Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(key_der.clone()))?;
     let (account2, credentials2) = Account::builder_with_http(Box::new(env.client.clone()))
-        .from_key((key2, PrivateKeyDer::try_from(key_der)?), directory_url)
+        .from_key(PrivateKeyDer::try_from(key_der)?, directory_url)
         .await?;
 
     // Both should be the same account

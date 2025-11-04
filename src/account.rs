@@ -438,10 +438,10 @@ impl AccountBuilder {
         directory_url: String,
         external_account: Option<&ExternalAccountKey>,
     ) -> Result<(Account, AccountCredentials), Error> {
-        let (key, key_pkcs8) = Key::generate_pkcs8()?;
+        let (_, key_pkcs8) = Key::generate_pkcs8()?;
         Self::create_inner(
             account,
-            (key, key_pkcs8),
+            key_pkcs8,
             external_account,
             Client::new(directory_url, self.http).await?,
         )
@@ -456,7 +456,7 @@ impl AccountBuilder {
     /// Yields an error if no account matching the given key exists on the server.
     pub async fn from_key(
         self,
-        key: (Key, PrivateKeyDer<'static>),
+        key: PrivateKeyDer<'static>,
         directory_url: String,
     ) -> Result<(Account, AccountCredentials), Error> {
         self.from_key_inner(key, directory_url, true).await
@@ -471,7 +471,7 @@ impl AccountBuilder {
     /// will create a new account if one doesn't already exist for the given key.
     pub async fn create_from_key(
         self,
-        key: (Key, PrivateKeyDer<'static>),
+        key: PrivateKeyDer<'static>,
         directory_url: String,
     ) -> Result<(Account, AccountCredentials), Error> {
         self.from_key_inner(key, directory_url, false).await
@@ -481,7 +481,7 @@ impl AccountBuilder {
     #[allow(clippy::wrong_self_convention)]
     async fn from_key_inner(
         self,
-        key: (Key, PrivateKeyDer<'static>),
+        key: PrivateKeyDer<'static>,
         directory_url: String,
         only_return_existing: bool,
     ) -> Result<(Account, AccountCredentials), Error> {
@@ -492,7 +492,7 @@ impl AccountBuilder {
                 only_return_existing,
             },
             match key {
-                (key, PrivateKeyDer::Pkcs8(pkcs8)) => (key, pkcs8),
+                PrivateKeyDer::Pkcs8(pkcs8) => pkcs8,
                 _ => return Err("unsupported key format, expected PKCS#8".into()),
             },
             None,
@@ -523,10 +523,11 @@ impl AccountBuilder {
 
     async fn create_inner(
         account: &NewAccount<'_>,
-        (key, key_pkcs8): (Key, PrivatePkcs8KeyDer<'static>),
+        key_pkcs8: PrivatePkcs8KeyDer<'static>,
         external_account: Option<&ExternalAccountKey>,
         client: Client,
     ) -> Result<(Account, AccountCredentials), Error> {
+        let key = Key::from_pkcs8_der(key_pkcs8.clone_key())?;
         let payload = NewAccountPayload {
             new_account: account,
             external_account_binding: external_account
