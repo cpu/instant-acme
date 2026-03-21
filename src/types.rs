@@ -689,18 +689,56 @@ impl fmt::Display for AuthorizedIdentifier<'_> {
 #[derive(Debug, Deserialize)]
 pub struct Challenge {
     /// Type of challenge
-    pub r#type: ChallengeType,
+    #[serde(flatten)]
+    pub state: ChallengeState,
     /// Challenge identifier
     pub url: String,
-    /// Token for this challenge
-    ///
-    /// Unknown `ChallengeType` instances may omit this field, leaving it empty.
-    #[serde(default)]
-    pub token: String,
     /// Current status
     pub status: ChallengeStatus,
     /// Potential error state
     pub error: Option<Problem>,
+}
+
+impl Challenge {
+    /// Get the token for this challenge, if it has one
+    pub fn token(&self) -> Option<&str> {
+        match &self.state {
+            ChallengeState::Http01 { token }
+            | ChallengeState::Dns01 { token }
+            | ChallengeState::TlsAlpn01 { token } => Some(token),
+            ChallengeState::DeviceAttest01 | ChallengeState::Unknown { .. } => None,
+        }
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type")]
+pub enum ChallengeState {
+    #[serde(rename = "http-01")]
+    Http01 { token: String },
+    #[serde(rename = "dns-01")]
+    Dns01 { token: String },
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01 { token: String },
+    /// Note: Device attestation support is experimental
+    #[serde(rename = "device-attest-01")]
+    DeviceAttest01,
+    #[serde(untagged)]
+    Unknown { r#type: String },
+}
+
+impl ChallengeState {
+    /// Get the type of this challenge
+    pub fn r#type(&self) -> ChallengeType {
+        match self {
+            Self::Http01 { .. } => ChallengeType::Http01,
+            Self::Dns01 { .. } => ChallengeType::Dns01,
+            Self::TlsAlpn01 { .. } => ChallengeType::TlsAlpn01,
+            Self::DeviceAttest01 => ChallengeType::DeviceAttest01,
+            Self::Unknown { r#type } => ChallengeType::Unknown(r#type.clone()),
+        }
+    }
 }
 
 /// The challenge type
@@ -1051,10 +1089,15 @@ mod tests {
         }"#;
 
         let obj = serde_json::from_str::<Challenge>(CHALLENGE).unwrap();
-        assert_eq!(obj.r#type, ChallengeType::Dns01);
+        assert_eq!(
+            obj.state,
+            ChallengeState::Dns01 {
+                token: "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA".to_owned()
+            }
+        );
+        assert_eq!(obj.state.r#type(), ChallengeType::Dns01);
         assert_eq!(obj.url, "https://example.com/acme/chall/Rg5dV14Gh1Q");
         assert_eq!(obj.status, ChallengeStatus::Pending);
-        assert_eq!(obj.token, "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA");
     }
 
     // https://datatracker.ietf.org/doc/html/rfc8555#section-7.6
