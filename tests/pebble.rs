@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::future::Future;
 use std::io::{self, Read};
 use std::net::IpAddr;
 use std::path::Path;
@@ -24,9 +25,8 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AuthorizationStatus, BodyWrapper, ChallengeHandle, ChallengeType, Error,
-    ExternalAccountKey, Identifier, Key, KeyAuthorization, NewAccount, NewOrder, Order,
-    OrderStatus, RetryPolicy,
+    Account, AuthorizationHandle, AuthorizationStatus, BodyWrapper, Error, ExternalAccountKey,
+    Identifier, Key, NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
 };
 #[cfg(all(feature = "time", feature = "x509-parser"))]
 use instant_acme::{CertificateIdentifier, RevocationRequest};
@@ -77,6 +77,215 @@ async fn dns_01() -> Result<(), Box<dyn StdError>> {
         ])))
         .await
         .map(|_| ())
+}
+
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    Environment::new(EnvironmentConfig::default())
+        .await?
+        .test::<DnsPersist01>(&NewOrder::new(&dns_identifiers([
+            "dns-persist01.example.com",
+        ])))
+        .await
+        .map(|_| ())
+}
+
+/// Test dns-persist-01 with persistUntil parameter
+///
+/// This test validates that dns-persist-01 works when the TXT record includes
+/// a `persistUntil` timestamp. Pebble validates that the current time is before
+/// the persistUntil value at validation time.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_persist_until() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    let env = Environment::new(EnvironmentConfig::default()).await?;
+    let identifiers = dns_identifiers(["persist-until.example.com"]);
+    let mut order = env.account.new_order(&NewOrder::new(&identifiers)).await?;
+
+    // Use a far-future timestamp (year 2100)
+    let config = DnsPersist01Config::default().persist_until(4102444800);
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        match authz.status {
+            AuthorizationStatus::Pending => {}
+            AuthorizationStatus::Valid => continue,
+            _ => unreachable!("unexpected authz state: {:?}", authz.status),
+        }
+        config
+            .handle_challenge(&mut authz, &env.client, env.config.challtestsrv_port)
+            .await?;
+    }
+
+    let status = order.poll_ready(&RETRY_POLICY).await?;
+    assert_eq!(status, OrderStatus::Ready);
+    env.certificate(&mut order).await?;
+
+    Ok(())
+}
+
+/// Test dns-persist-01 wildcard policy and authorization reuse
+///
+/// This test validates dns-persist-01 behavior:
+/// - Wildcard identifiers automatically get policy=wildcard
+/// - Non-wildcard identifiers can opt-in to policy=wildcard via the builder
+/// - Exact identifier matches are reused (authz reuse)
+///
+/// Note: Pebble doesn't yet implement Section 4.2 "Just-in-Time Validation" for
+/// subdomain validation based on parent domain's policy=wildcard.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_wildcard_policy() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    // Use 100% authz reuse to reliably test that authorizations are reused.
+    // Note: Pebble doesn't implement dns-persist-01 specific reuse logic -
+    // it treats authz reuse the same for all challenge types.
+    let mut env = Environment::new(EnvironmentConfig {
+        authz_reuse: 100,
+        ..EnvironmentConfig::default()
+    })
+    .await?;
+
+    // First order: establish dns-persist-01 records with different policies
+    // 1. *.wildcard-persist.example.com - automatically gets policy=wildcard
+    // 2. base-persist.example.com - explicitly opt-in to policy=wildcard
+    // 3. strict-persist.example.com - no wildcard policy (FQDN only)
+    let identifiers = dns_identifiers([
+        "*.wildcard-persist.example.com",
+        "base-persist.example.com",
+        "strict-persist.example.com",
+    ]);
+    let new_order = NewOrder::new(&identifiers);
+    debug!(identifiers = ?new_order.identifiers(), "creating order");
+    let mut order = env.account.new_order(&new_order).await?;
+    info!(order_url = order.url(), "created order");
+
+    let config = DnsPersist01Config::default().wildcard("base-persist");
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        match authz.status {
+            AuthorizationStatus::Pending => {}
+            AuthorizationStatus::Valid => continue,
+            _ => unreachable!("unexpected authz state: {:?}", authz.status),
+        }
+        config
+            .handle_challenge(&mut authz, &env.client, env.config.challtestsrv_port)
+            .await?;
+    }
+
+    let status = order.poll_ready(&RETRY_POLICY).await?;
+    assert_eq!(status, OrderStatus::Ready);
+    env.certificate(&mut order).await?;
+
+    // Second order: test authz reuse for exact identifier matches
+    // All authorizations should already be valid from the first order
+    env.test::<AlreadyValid>(&NewOrder::new(&dns_identifiers([
+        "*.wildcard-persist.example.com", // reused wildcard authz
+        "base-persist.example.com",       // reused explicit wildcard authz
+        "strict-persist.example.com",     // reused strict authz
+    ])))
+    .await?;
+
+    Ok(())
+}
+
+/// Test dns-persist-01 with RDATA > 255 bytes (requires splitting per RFC 1035)
+///
+/// When the dns-persist-01 TXT record value exceeds 255 octets, it must be split
+/// into multiple character-strings per RFC 1035 Section 3.3. This test configures
+/// Pebble with a long CAA identity to trigger this behavior.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_long_rdata() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    // Create a long issuer domain name that will cause the RDATA to exceed 255 bytes.
+    // Format: "{issuer}; accounturi={account_uri}" where account_uri is ~60 chars.
+    // We need issuer + ~75 chars overhead > 255, so issuer should be > 180 chars.
+    let long_issuer = format!(
+        "{}.{}.{}.long-issuer.example",
+        "a".repeat(60),
+        "b".repeat(60),
+        "c".repeat(60)
+    );
+    assert!(long_issuer.len() > 180, "issuer should be long enough");
+
+    let mut config = EnvironmentConfig::default();
+    config.pebble.caa_identities = vec![long_issuer.clone()];
+
+    let env = Environment::new(config).await?;
+    let identifiers = dns_identifiers(["long-rdata.example.com"]);
+    let new_order = NewOrder::new(&identifiers);
+    let mut order = env.account.new_order(&new_order).await?;
+
+    // Verify the challenge has our long issuer
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        if authz.status != AuthorizationStatus::Pending {
+            continue;
+        }
+
+        let mut challenge = authz
+            .dns_persist01()
+            .ok_or("no dns-persist-01 challenge found")?;
+
+        let record = challenge
+            .response_txt_record(challenge.issuer_domain_names().iter().next().unwrap())?
+            .build();
+
+        // Verify the record was split into multiple chunks
+        let rdata = record.rdata();
+        assert!(
+            rdata.len() > 1,
+            "expected RDATA to be split into multiple chunks"
+        );
+
+        // Provision the response and mark ready
+        // Note: challtestsrv handles the value as a single string and splits internally
+        let host = format!("{}.", record.name());
+        let value = rdata.join("");
+        debug!(
+            host,
+            value,
+            rdata_len = value.len(),
+            "provisioning long DNS-PERSIST-01 response"
+        );
+
+        #[derive(Serialize)]
+        struct SetTxtRequest {
+            host: String,
+            value: String,
+        }
+
+        let body = serde_json::to_vec(&SetTxtRequest { host, value })?;
+        let url = format!("http://[::1]:{}/set-txt", env.config.challtestsrv_port);
+        env.client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(BodyWrapper::from(body))?,
+            )
+            .await?;
+
+        challenge.set_ready().await?;
+    }
+
+    // Poll until the order is ready and issue certificate
+    let status = order.poll_ready(&RETRY_POLICY).await?;
+    assert_eq!(status, OrderStatus::Ready);
+    env.certificate(&mut order).await?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -644,16 +853,7 @@ impl Environment {
                 _ => unreachable!("unexpected authz state: {:?}", authz.status),
             }
 
-            let mut challenge = authz
-                .challenge(A::TYPE)
-                .ok_or_else(|| format!("no {:?} challenge found", A::TYPE))?;
-
-            let key_authz = challenge.key_authorization();
-            self.request_challenge::<A>(&challenge, &key_authz.unwrap())
-                .await?;
-
-            debug!(challenge_url = challenge.url, "marking challenge ready");
-            challenge.set_ready().await?;
+            A::handle_challenge(&mut authz, &self.client, self.config.challtestsrv_port).await?;
         }
 
         // Poll until the order is ready.
@@ -752,25 +952,6 @@ impl Environment {
         assert_eq!(roots.len(), 1);
         Ok(roots)
     }
-
-    async fn request_challenge<'a, A: AuthorizationMethod>(
-        &self,
-        challenge: &'a ChallengeHandle<'a>,
-        key_auth: &KeyAuthorization,
-    ) -> Result<(), Box<dyn StdError>> {
-        let url = format!("http://[::1]:{}/{}", self.config.challtestsrv_port, A::PATH);
-        let body = serde_json::to_vec(&A::authz_request(challenge, key_auth))?;
-        self.client
-            .request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(BodyWrapper::from(body))?,
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 fn dns_identifiers(dns_names: impl IntoIterator<Item = impl ToString>) -> Vec<Identifier> {
@@ -783,10 +964,14 @@ fn dns_identifiers(dns_names: impl IntoIterator<Item = impl ToString>) -> Vec<Id
 struct Http01;
 
 impl AuthorizationMethod for Http01 {
-    fn authz_request<'a>(
-        challenge: &'a ChallengeHandle<'a>,
-        key_auth: &'a KeyAuthorization,
-    ) -> impl Serialize + 'a {
+    async fn handle_challenge<'a>(
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut challenge = authz.http01().ok_or("no http-01 challenge found")?;
+
+        let key_auth = challenge.key_authorization();
         debug!(
             token = challenge.token(),
             key_auth = key_auth.as_str(),
@@ -799,30 +984,40 @@ impl AuthorizationMethod for Http01 {
             content: &'a str,
         }
 
-        AddHttp01Request {
-            token: &challenge.token().unwrap(),
+        let body = serde_json::to_vec(&AddHttp01Request {
+            token: challenge.token(),
             content: key_auth.as_str(),
-        }
-    }
+        })?;
 
-    const PATH: &str = "add-http01";
-    const TYPE: ChallengeType = ChallengeType::Http01;
+        let url = format!("http://[::1]:{}/add-http01", challtestsrv_port);
+        client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(BodyWrapper::from(body))?,
+            )
+            .await?;
+
+        debug!("marking challenge ready");
+        challenge.set_ready().await?;
+        Ok(())
+    }
 }
 
 struct Dns01;
 
 impl AuthorizationMethod for Dns01 {
-    fn authz_request<'a>(
-        challenge: &'a ChallengeHandle<'_>,
-        key_auth: &'a KeyAuthorization,
-    ) -> impl Serialize + 'a {
-        let identifier = challenge.identifier();
-        let Identifier::Dns(domain) = identifier.identifier else {
-            unreachable!("unsupported identifier {identifier:?}");
-        };
+    async fn handle_challenge<'a>(
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut challenge = authz.dns01().ok_or("no dns-01 challenge found")?;
 
-        let host = format!("_acme-challenge.{domain}.");
-        let value = key_auth.dns_value();
+        let host = format!("{}.", challenge.txt_record_name());
+        let value = challenge.txt_record_value();
         debug!(host, value, "provisioning DNS-01 response");
 
         #[derive(Serialize)]
@@ -831,20 +1026,154 @@ impl AuthorizationMethod for Dns01 {
             value: String,
         }
 
-        AddDns01Request { host, value }
+        let body = serde_json::to_vec(&AddDns01Request { host, value })?;
+
+        let url = format!("http://[::1]:{}/set-txt", challtestsrv_port);
+        client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(BodyWrapper::from(body))?,
+            )
+            .await?;
+
+        debug!("marking challenge ready");
+        challenge.set_ready().await?;
+        Ok(())
+    }
+}
+
+/// Configuration for dns-persist-01 challenge responses
+#[derive(Default)]
+struct DnsPersist01Config {
+    /// Domain substrings that should get explicit wildcard policy
+    wildcard_domains: Vec<&'static str>,
+    /// Optional persistUntil timestamp to include in all records
+    persist_until: Option<u64>,
+}
+
+impl DnsPersist01Config {
+    fn wildcard(mut self, domain_substring: &'static str) -> Self {
+        self.wildcard_domains.push(domain_substring);
+        self
     }
 
-    const PATH: &str = "set-txt";
-    const TYPE: ChallengeType = ChallengeType::Dns01;
+    fn persist_until(mut self, timestamp: u64) -> Self {
+        self.persist_until = Some(timestamp);
+        self
+    }
+
+    async fn handle_challenge<'a>(
+        &self,
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut challenge = authz
+            .dns_persist01()
+            .ok_or("no dns-persist-01 challenge found")?;
+
+        let issuer = challenge
+            .issuer_domain_names()
+            .iter()
+            .next()
+            .ok_or("no issuer domain names in challenge")?;
+
+        let ident = challenge.identifier();
+        let explicit_wildcard = match ident.identifier {
+            Identifier::Dns(ref domain) => self
+                .wildcard_domains
+                .iter()
+                .any(|substr| domain.contains(substr)),
+            _ => false,
+        };
+
+        let mut builder = challenge.response_txt_record(issuer)?;
+        if explicit_wildcard {
+            builder = builder.wildcard();
+        }
+        if let Some(timestamp) = self.persist_until {
+            builder = builder.persist_until(timestamp);
+        }
+        let record = builder.build();
+
+        let host = format!("{}.", record.name());
+        let value = record.rdata().join("");
+        debug!(
+            host,
+            value,
+            wildcard = ident.wildcard || explicit_wildcard,
+            "provisioning DNS-PERSIST-01 response"
+        );
+
+        #[derive(Serialize)]
+        struct SetTxtRequest {
+            host: String,
+            value: String,
+        }
+
+        let body = serde_json::to_vec(&SetTxtRequest { host, value })?;
+
+        let url = format!("http://[::1]:{}/set-txt", challtestsrv_port);
+        client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(BodyWrapper::from(body))?,
+            )
+            .await?;
+
+        debug!("marking challenge ready");
+        challenge.set_ready().await?;
+        Ok(())
+    }
+}
+
+struct DnsPersist01;
+
+impl AuthorizationMethod for DnsPersist01 {
+    async fn handle_challenge<'a>(
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        DnsPersist01Config::default()
+            .handle_challenge(authz, client, challtestsrv_port)
+            .await
+    }
+}
+
+/// No-op authorization method that expects all authorizations to already be valid
+///
+/// This is useful for testing authz reuse or just-in-time validation scenarios
+/// where no new challenges should need to be completed.
+struct AlreadyValid;
+
+impl AuthorizationMethod for AlreadyValid {
+    async fn handle_challenge<'a>(
+        _authz: &'a mut AuthorizationHandle<'a>,
+        _client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        _challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        Err("expected authorization to already be valid, but got pending challenge".into())
+    }
 }
 
 struct Alpn01;
 
 impl AuthorizationMethod for Alpn01 {
-    fn authz_request<'a>(
-        challenge: &'a ChallengeHandle<'a>,
-        key_auth: &'a KeyAuthorization,
-    ) -> impl Serialize + 'a {
+    async fn handle_challenge<'a>(
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut challenge = authz.tls_alpn01().ok_or("no tls-alpn-01 challenge found")?;
+
+        let key_auth = challenge.key_authorization();
         debug!(
             identifier = %challenge.identifier(),
             key_auth = key_auth.as_str(),
@@ -857,28 +1186,38 @@ impl AuthorizationMethod for Alpn01 {
             content: &'a str,
         }
 
-        AddAlpn01Request {
+        let body = serde_json::to_vec(&AddAlpn01Request {
             host: challenge.identifier().to_string(),
             // Note: pebble-challtestsrv wants to hash the key auth itself, so we
             // don't use key_auth.digest() here.
             content: key_auth.as_str(),
-        }
-    }
+        })?;
 
-    const PATH: &str = "add-tlsalpn01";
-    const TYPE: ChallengeType = ChallengeType::TlsAlpn01;
+        let url = format!("http://[::1]:{}/add-tlsalpn01", challtestsrv_port);
+        client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(BodyWrapper::from(body))?,
+            )
+            .await?;
+
+        debug!("marking challenge ready");
+        challenge.set_ready().await?;
+        Ok(())
+    }
 }
 
 /// A trait for something able to provision a challenge response with an external system
 trait AuthorizationMethod {
-    /// Provision a challenge response for the given identifier, challenge, and key auth.
-    fn authz_request<'a>(
-        challenge: &'a ChallengeHandle<'a>,
-        key_auth: &'a KeyAuthorization,
-    ) -> impl Serialize + 'a;
-
-    const PATH: &str;
-    const TYPE: ChallengeType;
+    /// Handle the challenge for this authorization method
+    fn handle_challenge<'a>(
+        authz: &'a mut AuthorizationHandle<'a>,
+        client: &HyperClient<hyper_rustls::HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
+        challtestsrv_port: u16,
+    ) -> impl Future<Output = Result<(), Box<dyn StdError>>> + Send;
 }
 
 /// Wait for the server at the given address to be ready
@@ -933,6 +1272,11 @@ struct PebbleConfig {
     domain_blocklist: Vec<&'static str>,
     retry_after: RetryConfig,
     profiles: HashMap<&'static str, Profile>,
+    /// CAA identities returned in dns-persist-01 challenges as issuerDomainNames
+    ///
+    /// Defaults to `["pebble.letsencrypt.org"]` if empty/unset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    caa_identities: Vec<String>,
 }
 
 impl Default for PebbleConfig {
@@ -972,6 +1316,7 @@ impl Default for PebbleConfig {
                 ),
             ]
             .into(),
+            caa_identities: Vec::new(),
         }
     }
 }

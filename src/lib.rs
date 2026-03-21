@@ -38,16 +38,19 @@ pub use account::Key;
 pub use account::{Account, AccountBuilder, ExternalAccountKey};
 mod order;
 pub use order::{
-    AuthorizationHandle, Authorizations, ChallengeHandle, Identifiers, KeyAuthorization, Order,
-    RetryPolicy,
+    AuthorizationHandle, Authorizations, DeviceAttest01ChallengeHandle, Dns01ChallengeHandle,
+    DnsPersist01ChallengeHandle, DnsPersist01Record, DnsPersist01RecordBuilder,
+    Http01ChallengeHandle, Identifiers, KeyAuthorization, Order, RetryPolicy,
+    TlsAlpn01ChallengeHandle,
 };
 mod types;
 pub use types::{
     AccountCredentials, Authorization, AuthorizationState, AuthorizationStatus,
     AuthorizedIdentifier, CertificateIdentifier, Challenge, ChallengeState, ChallengeStatus,
-    ChallengeType, DeviceAttestation, Error, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderState, OrderStatus, Problem, ProfileMeta, RevocationReason, RevocationRequest, Subproblem,
-    ZeroSsl,
+    ChallengeType, DeviceAttestation, Dns01Challenge, DnsPersist01Challenge, Error,
+    Http01Challenge, Identifier, IssuerDomainName, IssuerDomainNames, LetsEncrypt, NewAccount,
+    NewOrder, OrderState, OrderStatus, Problem, ProfileMeta, RevocationReason, RevocationRequest,
+    Subproblem, TlsAlpn01Challenge, ZeroSsl,
 };
 use types::{Directory, JoseJson, Signer};
 #[cfg(feature = "time")]

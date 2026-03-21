@@ -13,9 +13,14 @@ use tokio::time::sleep;
 use crate::account::AccountInner;
 use crate::types::{
     Authorization, AuthorizationState, AuthorizationStatus, AuthorizedIdentifier, Challenge,
-    ChallengeType, DeviceAttestation, Empty, FinalizeRequest, OrderState, OrderStatus, Problem,
+    ChallengeState, DeviceAttestation, Dns01Challenge, DnsPersist01Challenge, Empty,
+    FinalizeRequest, Http01Challenge, Identifier, OrderState, OrderStatus, Problem,
+    TlsAlpn01Challenge,
 };
-use crate::{ChallengeStatus, Error, Key, crypto, nonce_from_response, retry_after};
+use crate::{
+    ChallengeStatus, ChallengeType, Error, IssuerDomainName, IssuerDomainNames, Key, crypto,
+    nonce_from_response, retry_after,
+};
 
 /// An ACME order as described in RFC 8555 (section 7.1.3)
 ///
@@ -275,7 +280,7 @@ pub struct Identifiers<'a> {
 }
 
 impl<'a> Identifiers<'a> {
-    /// Yield the next [`Identifier`][crate::Identifier], fetching the authorization's state if
+    /// Yield the next [`Identifier`], fetching the authorization's state if
     /// we don't have it yet
     pub async fn next(&mut self) -> Option<Result<AuthorizedIdentifier<'a>, Error>> {
         Some(match self.inner.next().await? {
@@ -319,11 +324,11 @@ impl<'a> AuthStream<'a> {
 ///
 /// For each authorization, you'll need to:
 ///
-/// * Select which [`ChallengeType`] you want to complete
-/// * Call [`AuthorizationHandle::challenge()`] to get a [`ChallengeHandle`]
-/// * Use the `ChallengeHandle` to complete the authorization's challenge
+/// * Select which challenge type you want to complete
+/// * Call the corresponding method (e.g., [`dns01()`][Self::dns01]) to get a typed challenge handle
+/// * Use the handle to complete the authorization's challenge
 ///
-/// <https://datatracker.ietf.org/doc/html/rfc8555#section-7.1.3>
+/// <https://datatracker.ietf.org/doc/html/rfc8555#section-7.1.4>
 pub struct AuthorizationHandle<'a> {
     state: &'a mut AuthorizationState,
     url: &'a str,
@@ -390,20 +395,98 @@ impl<'a> AuthorizationHandle<'a> {
         }
     }
 
-    /// Get a [`ChallengeHandle`] for the given `type`
+    /// Get a handle for the HTTP-01 challenge, if present
+    pub fn http01(&'a mut self) -> Option<Http01ChallengeHandle<'a>> {
+        let challenge = challenge_for_type(&self.state.challenges, ChallengeType::Http01)?;
+
+        let ChallengeState::Http01(data) = &challenge.state else {
+            return None;
+        };
+
+        Some(Http01ChallengeHandle {
+            state: ChallengeHandleState {
+                identifier: self.state.identifier(),
+                challenge,
+                nonce: self.nonce,
+                account: self.account,
+            },
+            challenge: data,
+        })
+    }
+
+    /// Get a handle for the DNS-01 challenge, if present
+    pub fn dns01(&'a mut self) -> Option<Dns01ChallengeHandle<'a>> {
+        let challenge = challenge_for_type(&self.state.challenges, ChallengeType::Dns01)?;
+
+        let ChallengeState::Dns01(data) = &challenge.state else {
+            return None;
+        };
+
+        Some(Dns01ChallengeHandle {
+            state: ChallengeHandleState {
+                identifier: self.state.identifier(),
+                challenge,
+                nonce: self.nonce,
+                account: self.account,
+            },
+            challenge: data,
+        })
+    }
+
+    /// Get a handle for the TLS-ALPN-01 challenge, if present
+    pub fn tls_alpn01(&'a mut self) -> Option<TlsAlpn01ChallengeHandle<'a>> {
+        let challenge = challenge_for_type(&self.state.challenges, ChallengeType::TlsAlpn01)?;
+
+        let ChallengeState::TlsAlpn01(data) = &challenge.state else {
+            return None;
+        };
+
+        Some(TlsAlpn01ChallengeHandle {
+            state: ChallengeHandleState {
+                identifier: self.state.identifier(),
+                challenge,
+                nonce: self.nonce,
+                account: self.account,
+            },
+            challenge: data,
+        })
+    }
+
+    /// Get a handle for the DNS-PERSIST-01 challenge, if present
     ///
-    /// Yields an object to interact with the challenge for the given type, if available.
-    pub fn challenge(&'a mut self, r#type: ChallengeType) -> Option<ChallengeHandle<'a>> {
-        let challenge = self
-            .state
-            .challenges
-            .iter()
-            .find(|c| c.state.r#type() == r#type)?;
-        Some(ChallengeHandle {
-            identifier: self.state.identifier(),
-            challenge,
-            nonce: self.nonce,
-            account: self.account,
+    /// Note: DNS persist challenge support is experimental.
+    pub fn dns_persist01(&'a mut self) -> Option<DnsPersist01ChallengeHandle<'a>> {
+        let challenge = challenge_for_type(&self.state.challenges, ChallengeType::DnsPersist01)?;
+
+        let ChallengeState::DnsPersist01(data) = &challenge.state else {
+            return None;
+        };
+
+        Some(DnsPersist01ChallengeHandle {
+            state: ChallengeHandleState {
+                identifier: self.state.identifier(),
+                challenge,
+                nonce: self.nonce,
+                account: self.account,
+            },
+            challenge: data,
+        })
+    }
+
+    /// Get a handle for the device-attest-01 challenge, if present
+    ///
+    /// Note: Device attestation support is experimental.
+    pub fn device_attest01(&'a mut self) -> Option<DeviceAttest01ChallengeHandle<'a>> {
+        Some(DeviceAttest01ChallengeHandle {
+            state: ChallengeHandleState {
+                identifier: self.state.identifier(),
+                challenge: challenge_for_type(
+                    &self.state.challenges,
+                    ChallengeType::DeviceAttest01,
+                )?,
+                nonce: self.nonce,
+                account: self.account,
+            },
         })
     }
 
@@ -411,6 +494,10 @@ impl<'a> AuthorizationHandle<'a> {
     pub fn url(&self) -> &str {
         self.url
     }
+}
+
+fn challenge_for_type(challenges: &[Challenge], r#type: ChallengeType) -> Option<&Challenge> {
+    challenges.iter().find(|c| c.state.r#type() == r#type)
 }
 
 impl Deref for AuthorizationHandle<'_> {
@@ -421,29 +508,16 @@ impl Deref for AuthorizationHandle<'_> {
     }
 }
 
-/// Wrapper type for interacting with a [`Challenge`]'s state
-///
-/// For traditional DNS-01, HTTP-01 or TLS-ALPN-01 challenges, you'll need to:
-///
-/// * Obtain the [`ChallengeHandle::key_authorization()`] for the challenge response
-/// * Set up the challenge response in your infrastructure (details vary by challenge type)
-/// * Call [`ChallengeHandle::set_ready()`] for that challenge after setup is complete
-///
-/// After the challenges have been set to ready, call [`Order::poll_ready()`] to wait until the
-/// order is ready to be finalized (or to learn if it becomes invalid). Once it is ready, call
-/// [`Order::finalize()`] to get the certificate.
-///
-/// Dereferences to the underlying [`Challenge`] for easy access to the challenge's state.
-pub struct ChallengeHandle<'a> {
+/// Shared state for challenge handles
+struct ChallengeHandleState<'a> {
     identifier: AuthorizedIdentifier<'a>,
     challenge: &'a Challenge,
     nonce: &'a mut Option<String>,
     account: &'a AccountInner,
 }
 
-impl ChallengeHandle<'_> {
-    /// Notify the server that the given challenge is ready to be completed
-    pub async fn set_ready(&mut self) -> Result<(), Error> {
+impl ChallengeHandleState<'_> {
+    async fn set_ready(&mut self) -> Result<(), Error> {
         let rsp = self
             .account
             .post(Some(&Empty {}), self.nonce.take(), &self.challenge.url)
@@ -456,27 +530,390 @@ impl ChallengeHandle<'_> {
             None => Ok(()),
         }
     }
+}
 
+/// Handle for HTTP-01 challenges
+pub struct Http01ChallengeHandle<'a> {
+    state: ChallengeHandleState<'a>,
+    challenge: &'a Http01Challenge,
+}
+
+impl Http01ChallengeHandle<'_> {
+    /// Notify the server that the challenge is ready to be completed
+    pub async fn set_ready(&mut self) -> Result<(), Error> {
+        self.state.set_ready().await
+    }
+
+    /// The token for this challenge
+    pub fn token(&self) -> &str {
+        &self.challenge.token
+    }
+
+    /// Create a [`KeyAuthorization`] for this challenge
+    pub fn key_authorization(&self) -> KeyAuthorization {
+        KeyAuthorization::new(&self.challenge.token, &self.state.account.key)
+    }
+
+    /// The identifier for this challenge's authorization
+    pub fn identifier(&self) -> &AuthorizedIdentifier<'_> {
+        &self.state.identifier
+    }
+}
+
+/// Handle for DNS-01 challenges
+pub struct Dns01ChallengeHandle<'a> {
+    state: ChallengeHandleState<'a>,
+    challenge: &'a Dns01Challenge,
+}
+
+impl Dns01ChallengeHandle<'_> {
+    /// Notify the server that the challenge is ready to be completed
+    pub async fn set_ready(&mut self) -> Result<(), Error> {
+        self.state.set_ready().await
+    }
+
+    /// The token for this challenge
+    pub fn token(&self) -> &str {
+        &self.challenge.token
+    }
+
+    /// Create a [`KeyAuthorization`] for this challenge
+    pub fn key_authorization(&self) -> KeyAuthorization {
+        KeyAuthorization::new(&self.challenge.token, &self.state.account.key)
+    }
+
+    /// The identifier for this challenge's authorization
+    pub fn identifier(&self) -> &AuthorizedIdentifier<'_> {
+        &self.state.identifier
+    }
+
+    /// Get the DNS TXT record name for this challenge
+    ///
+    /// Returns the record name in the format `_acme-challenge.{domain}`.
+    /// For wildcard identifiers, the wildcard prefix is stripped (e.g., for
+    /// `*.example.com`, this returns `_acme-challenge.example.com`).
+    pub fn txt_record_name(&self) -> String {
+        let ident = &self.state.identifier;
+        match ident.identifier {
+            Identifier::Dns(dns) => format!("_acme-challenge.{dns}"),
+            _ => format!("_acme-challenge.{ident}"),
+        }
+    }
+
+    /// Get the DNS TXT record value for this challenge
+    ///
+    /// Returns the base64url-encoded SHA-256 digest of the key authorization.
+    pub fn txt_record_value(&self) -> String {
+        self.key_authorization().dns_value()
+    }
+}
+
+/// Handle for TLS-ALPN-01 challenges
+pub struct TlsAlpn01ChallengeHandle<'a> {
+    state: ChallengeHandleState<'a>,
+    challenge: &'a TlsAlpn01Challenge,
+}
+
+impl TlsAlpn01ChallengeHandle<'_> {
+    /// Notify the server that the challenge is ready to be completed
+    pub async fn set_ready(&mut self) -> Result<(), Error> {
+        self.state.set_ready().await
+    }
+
+    /// The token for this challenge
+    pub fn token(&self) -> &str {
+        &self.challenge.token
+    }
+
+    /// Create a [`KeyAuthorization`] for this challenge
+    pub fn key_authorization(&self) -> KeyAuthorization {
+        KeyAuthorization::new(&self.challenge.token, &self.state.account.key)
+    }
+
+    /// The identifier for this challenge's authorization
+    pub fn identifier(&self) -> &AuthorizedIdentifier<'_> {
+        &self.state.identifier
+    }
+}
+
+/// Handle for DNS-PERSIST-01 challenges
+///
+/// Note: DNS persist challenge support is experimental.
+pub struct DnsPersist01ChallengeHandle<'a> {
+    state: ChallengeHandleState<'a>,
+    challenge: &'a DnsPersist01Challenge,
+}
+
+impl DnsPersist01ChallengeHandle<'_> {
+    /// Notify the server that the challenge is ready to be completed
+    pub async fn set_ready(&mut self) -> Result<(), Error> {
+        self.state.set_ready().await
+    }
+
+    /// The issuer domain names accepted by the CA
+    pub fn issuer_domain_names(&self) -> &IssuerDomainNames {
+        &self.challenge.issuer_domain_names
+    }
+
+    /// The identifier for this challenge's authorization
+    pub fn identifier(&self) -> &AuthorizedIdentifier<'_> {
+        &self.state.identifier
+    }
+
+    /// Create a builder for the DNS TXT record response
+    ///
+    /// The `issuer` must be one of the issuer domain names returned by
+    /// [`issuer_domain_names()`][Self::issuer_domain_names()]. Returns an error
+    /// if the provided issuer is not in the challenge's list of accepted issuers.
+    ///
+    /// The account URI is automatically populated from the account used to create
+    /// the order.
+    ///
+    /// If the challenge authorizes a wildcard DNS identifier, the challenge response
+    /// wildcard policy will be automatically set to true.
+    pub fn response_txt_record<'a>(
+        &'a self,
+        issuer: &'a IssuerDomainName,
+    ) -> Result<DnsPersist01RecordBuilder<'a>, Error> {
+        DnsPersist01RecordBuilder::new(
+            &self.state.account.id,
+            issuer,
+            self.challenge,
+            self.state.identifier,
+        )
+    }
+}
+
+/// Builder for creating a DNS-PERSIST-01 TXT record
+///
+/// Created via [`DnsPersist01ChallengeHandle::response_txt_record()`].
+#[derive(Debug)]
+pub struct DnsPersist01RecordBuilder<'a> {
+    account_uri: &'a str,
+    issuer: &'a IssuerDomainName,
+    identifier: AuthorizedIdentifier<'a>,
+    persist_until: Option<u64>,
+    wildcard: bool,
+}
+
+impl<'a> DnsPersist01RecordBuilder<'a> {
+    /// Create a new builder for a DNS-PERSIST-01 record
+    ///
+    /// Validates that:
+    /// - The issuer is in the challenge's list of accepted issuer domain names
+    /// - The identifier is a DNS identifier
+    ///
+    /// The `wildcard` field is automatically set based on the identifier's wildcard flag.
+    pub(crate) fn new(
+        account_uri: &'a str,
+        issuer: &'a IssuerDomainName,
+        challenge: &'a DnsPersist01Challenge,
+        identifier: AuthorizedIdentifier<'a>,
+    ) -> Result<Self, Error> {
+        if !matches!(identifier.identifier, Identifier::Dns(_)) {
+            return Err(Error::Str(
+                "dns-persist-01 challenge requires a DNS identifier",
+            ));
+        }
+
+        if !account_uri.is_ascii() {
+            return Err(Error::Str("account URI must be ASCII"));
+        }
+
+        if !challenge.issuer_domain_names.as_ref().contains(issuer) {
+            return Err(Error::InvalidIssuerDomains(format!(
+                "issuer '{}' is not in the challenge's issuer domain names",
+                issuer.as_ref()
+            )));
+        }
+
+        Ok(Self {
+            account_uri,
+            issuer,
+            identifier,
+            persist_until: None,
+            wildcard: identifier.wildcard,
+        })
+    }
+
+    /// Set the `persistUntil` parameter
+    ///
+    /// The value must be a base-10 encoded integer representing a UNIX timestamp
+    /// (the number of seconds since 1970-01-01T00:00:00Z ignoring leap seconds).
+    ///
+    /// CAs will not consider the validation record valid for new validation
+    /// attempts after the specified timestamp.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-00#section-7.9>
+    /// for important considerations for domain owners using this parameter.
+    pub fn persist_until(mut self, timestamp: u64) -> Self {
+        self.persist_until = Some(timestamp);
+        self
+    }
+
+    /// Enable the `policy=wildcard` parameter
+    ///
+    /// Builders created from a [`DnsPersist01ChallengeHandle`] corresponding to a
+    /// wildcard identifier will automatically enable this policy.
+    ///
+    /// For other non-wildcard identifiers, opting in to this policy by calling
+    /// `wildcard()` will allow you to issue for wildcard identifiers using the
+    /// same ACME account in the future.
+    ///
+    /// When set, the validation will be sufficient for issuing certificates for:
+    /// - The validated FQDN itself
+    /// - Wildcard certificates (e.g., `*.example.com`)
+    /// - Specific subdomains of the validated FQDN
+    pub fn wildcard(mut self) -> Self {
+        self.wildcard = true;
+        self
+    }
+
+    /// Build the final [`DnsPersist01Record`]
+    ///
+    /// Use the returned record to update your authoritative DNS with the challenge
+    /// response record contents.
+    pub fn build(self) -> DnsPersist01Record {
+        let mut rdata = format!("{}; accounturi={}", self.issuer.as_ref(), self.account_uri);
+
+        if self.wildcard {
+            rdata.push_str("; policy=wildcard");
+        }
+
+        if let Some(timestamp) = self.persist_until {
+            rdata.push_str(&format!("; persistUntil={}", timestamp));
+        }
+
+        DnsPersist01Record::new(self.identifier.identifier, &rdata)
+    }
+}
+
+/// A DNS TXT record for DNS-PERSIST-01 validation
+///
+/// This struct represents the complete DNS TXT record that should be provisioned
+/// in an authoritative DNS zone to complete a dns-persist-01 challenge.
+///
+/// The RDATA is stored as a vector of strings, where each string is at most 255
+/// octets as required by RFC 1035 Section 3.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DnsPersist01Record {
+    name: String,
+    rdata: Vec<String>,
+}
+
+impl DnsPersist01Record {
+    /// Maximum length of a single character-string in DNS TXT RDATA (RFC 1035 Section 3.3)
+    const MAX_CHAR_STRING_LEN: usize = 255;
+
+    /// Create a new `DnsPersist01Record` from an identifier and raw RDATA string.
+    ///
+    /// The name is formatted with the `_validation-persist.` prefix, and the RDATA
+    /// is automatically split into chunks of at most 255 octets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifier is not a DNS identifier.
+    pub(crate) fn new(identifier: &Identifier, rdata: &str) -> Self {
+        let domain = match identifier {
+            Identifier::Dns(dns) => dns.as_str(),
+            other => panic!("dns-persist-01 requires DNS identifier, got {other:?}"),
+        };
+        Self {
+            name: format!("_validation-persist.{domain}"),
+            rdata: Self::split_into_chunks(rdata),
+        }
+    }
+
+    /// The DNS record name (e.g., `_validation-persist.example.com`)
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The DNS TXT record RDATA as a slice of character-strings.
+    ///
+    /// Each string is at most 255 octets as required by RFC 1035 Section 3.3.
+    /// When the total RDATA exceeds 255 octets, it is split into multiple strings.
+    pub fn rdata(&self) -> &[String] {
+        &self.rdata
+    }
+
+    /// Format the record as a DNS zone file entry.
+    ///
+    /// Returns a string in RFC 1035 zone file format, suitable for inclusion
+    /// in authoritative DNS zone files. Multi-string RDATA is formatted with
+    /// parentheses and proper quoting.
+    ///
+    /// # Example output
+    ///
+    /// For short RDATA (single character-string):
+    /// ```text
+    /// _validation-persist.example.com. IN TXT "authority.example; accounturi=https://ca.example/acct/123"
+    /// ```
+    ///
+    /// For long RDATA (multiple character-strings):
+    /// ```text
+    /// _validation-persist.example.com. IN TXT ("first-part-of-long-string..."
+    ///  "...second-part-of-long-string")
+    /// ```
+    pub fn dns_zone_record(&self) -> String {
+        if self.rdata.len() == 1 {
+            format!("{}. IN TXT \"{}\"", self.name, self.rdata[0])
+        } else {
+            let mut result = format!("{}. IN TXT (", self.name);
+            for (i, part) in self.rdata.iter().enumerate() {
+                if i > 0 {
+                    result.push_str("\n ");
+                }
+                result.push('"');
+                result.push_str(part);
+                result.push('"');
+            }
+            result.push(')');
+            result
+        }
+    }
+
+    /// Split a value into chunks of at most 255 bytes.
+    fn split_into_chunks(value: &str) -> Vec<String> {
+        value
+            .as_bytes()
+            .chunks(Self::MAX_CHAR_STRING_LEN)
+            .map(|chunk| {
+                std::str::from_utf8(chunk)
+                    .unwrap(/* Safety: DnsPersist01RecordBuilder verifies inputs are ASCII*/)
+                    .to_owned()
+            })
+            .collect()
+    }
+}
+
+/// Handle for device-attest-01 challenges
+///
+/// Note: Device attestation support is experimental.
+pub struct DeviceAttest01ChallengeHandle<'a> {
+    state: ChallengeHandleState<'a>,
+}
+
+impl DeviceAttest01ChallengeHandle<'_> {
     /// Notify the server that the challenge is ready by sending a device attestation
     ///
-    /// This function is for the ACME challenge device-attest-01. It should not be used
-    /// with other challenge types.
     /// See <https://datatracker.ietf.org/doc/draft-acme-device-attest/> for details.
     ///
-    /// `payload` is the device attestation object as defined in link. Provide the attestation
-    /// object as a raw blob. Base64 encoding of the attestation object `payload.att_obj`
-    /// is done by this function.
+    /// `payload` is the device attestation object. Provide the attestation
+    /// object as a raw blob; base64 encoding is done by this function.
     ///
-    /// The function yields the challenge status from the ACME server that validated the
-    /// attestation challenge.
-    ///
-    /// Note: Device attestation support is experimental.
-    pub async fn send_device_attestation(
+    /// Returns an error if the identifier is not a `PermanentIdentifier` or `HardwareModule`.
+    pub async fn send_attestation(
         &mut self,
         payload: &DeviceAttestation<'_>,
     ) -> Result<ChallengeStatus, Error> {
-        if self.challenge.state.r#type() != ChallengeType::DeviceAttest01 {
-            return Err(Error::Str("challenge type should be device-attest-01"));
+        if !matches!(
+            self.state.identifier.identifier,
+            Identifier::PermanentIdentifier(_) | Identifier::HardwareModule(_)
+        ) {
+            return Err(Error::Str(
+                "device-attest-01 challenge requires a PermanentIdentifier or HardwareModule identifier",
+            ));
         }
 
         #[derive(Serialize)]
@@ -490,11 +927,16 @@ impl ChallengeHandle<'_> {
         };
 
         let rsp = self
+            .state
             .account
-            .post(Some(&payload), self.nonce.take(), &self.challenge.url)
+            .post(
+                Some(&payload),
+                self.state.nonce.take(),
+                &self.state.challenge.url,
+            )
             .await?;
 
-        *self.nonce = nonce_from_response(&rsp);
+        *self.state.nonce = nonce_from_response(&rsp);
         let response = Problem::check::<Challenge>(rsp).await?;
         match response.error {
             Some(details) => Err(Error::Api(details)),
@@ -502,30 +944,9 @@ impl ChallengeHandle<'_> {
         }
     }
 
-    /// Create a [`KeyAuthorization`] for this challenge, if applicable.
-    ///
-    /// Combines a challenge's token with the thumbprint of the account's public key to compute
-    /// the challenge's `KeyAuthorization`. The `KeyAuthorization` must be used to provision the
-    /// expected challenge response based on the challenge type in use.
-    ///
-    /// If the challenge doesn't have a token, `None` will be returned.
-    pub fn key_authorization(&self) -> Option<KeyAuthorization> {
-        self.challenge
-            .token()
-            .map(|token| KeyAuthorization::new(token, &self.account.key))
-    }
-
     /// The identifier for this challenge's authorization
     pub fn identifier(&self) -> &AuthorizedIdentifier<'_> {
-        &self.identifier
-    }
-}
-
-impl Deref for ChallengeHandle<'_> {
-    type Target = Challenge;
-
-    fn deref(&self) -> &Self::Target {
-        self.challenge
+        &self.state.identifier
     }
 }
 
@@ -661,5 +1082,375 @@ impl RetryState {
             true => ControlFlow::Break(Error::Timeout(None)),
             false => ControlFlow::Continue(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_challenge(issuers: Vec<&str>) -> DnsPersist01Challenge {
+        let issuer_domain_names =
+            IssuerDomainNames::new(issuers.into_iter().map(|s| s.parse().unwrap()).collect())
+                .unwrap();
+        DnsPersist01Challenge {
+            issuer_domain_names,
+        }
+    }
+
+    // RFC draft-ietf-acme-dns-persist-00 Section 10.1: Basic Validation Example (FQDN Only)
+    #[test]
+    fn dns_persist_basic_validation() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example", "ca.example.net"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.com");
+        assert_eq!(
+            record.rdata(),
+            &["authority.example; accounturi=https://ca.example/acct/123"]
+        );
+    }
+
+    // RFC draft-ietf-acme-dns-persist-00 Section 10.2: Wildcard Validation Example
+    #[test]
+    fn dns_persist_wildcard_validation() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        // Wildcard is automatically set from the identifier
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(true),
+        )
+        .unwrap()
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.com");
+        assert_eq!(
+            record.rdata(),
+            &["authority.example; accounturi=https://ca.example/acct/123; policy=wildcard"]
+        );
+    }
+
+    // RFC draft-ietf-acme-dns-persist-00 Section 10.3: Validation Example with persistUntil
+    #[test]
+    fn dns_persist_with_persist_until() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .persist_until(1721952000)
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.com");
+        assert_eq!(
+            record.rdata(),
+            &["authority.example; accounturi=https://ca.example/acct/123; persistUntil=1721952000"]
+        );
+    }
+
+    // RFC draft-ietf-acme-dns-persist-00 Section 10.4: Wildcard Validation Example with persistUntil
+    #[test]
+    fn dns_persist_wildcard_with_persist_until() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(true),
+        )
+        .unwrap()
+        .persist_until(1721952000)
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.com");
+        assert_eq!(
+            record.rdata(),
+            &[
+                "authority.example; accounturi=https://ca.example/acct/123; policy=wildcard; persistUntil=1721952000"
+            ]
+        );
+    }
+
+    // RFC draft-ietf-acme-dns-persist-00 Section 4.1.4: Example with different issuer
+    #[test]
+    fn dns_persist_alternate_issuer() {
+        let identifier = Identifier::Dns("example.org".into());
+        let challenge = make_challenge(vec!["ca2.example"]);
+        let issuer: IssuerDomainName = "ca2.example".parse().unwrap();
+        let account_uri = "https://ca2.example/acme/acct/67890";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .persist_until(1767225600)
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.org");
+        assert_eq!(
+            record.rdata(),
+            &[
+                "ca2.example; accounturi=https://ca2.example/acme/acct/67890; persistUntil=1767225600"
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_persist_record_serialization() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"name\":\"_validation-persist.example.com\""));
+        assert!(
+            json.contains(
+                "\"rdata\":[\"authority.example; accounturi=https://ca.example/acct/123\"]"
+            )
+        );
+    }
+
+    #[test]
+    fn dns_persist_invalid_issuer() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let bad_issuer: IssuerDomainName = "other.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let err = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &bad_issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidIssuerDomains(_)));
+    }
+
+    #[test]
+    fn dns_persist_non_dns_identifier() {
+        let identifier = Identifier::Ip("192.0.2.1".parse().unwrap());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let err = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Str(_)));
+    }
+
+    #[test]
+    fn dns_persist_explicit_wildcard_on_non_wildcard_identifier() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        // Explicitly enable wildcard even though identifier is not wildcard
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .wildcard()
+        .build();
+
+        assert_eq!(record.name(), "_validation-persist.example.com");
+        assert_eq!(
+            record.rdata(),
+            &["authority.example; accounturi=https://ca.example/acct/123; policy=wildcard"]
+        );
+    }
+
+    // RFC 1035 Section 3.3: TXT RDATA must be split into <=255 octet character-strings
+    #[test]
+    fn dns_persist_long_rdata_splits_into_chunks() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        // Create a very long account URI that will exceed 255 octets total
+        let long_path = "a".repeat(300);
+        let account_uri = format!("https://ca.example/acct/{long_path}");
+
+        let record = DnsPersist01RecordBuilder::new(
+            &account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        // Should be split into multiple chunks
+        assert!(record.rdata().len() > 1, "expected multiple chunks");
+
+        // Each chunk should be at most 255 octets
+        for chunk in record.rdata() {
+            assert!(
+                chunk.len() <= 255,
+                "chunk length {} exceeds 255",
+                chunk.len()
+            );
+        }
+
+        // Joining the chunks should give us the original value
+        let joined: String = record.rdata().iter().map(|s| s.as_str()).collect();
+        assert!(joined.starts_with("authority.example; accounturi="));
+        assert!(joined.contains(&long_path));
+    }
+
+    #[test]
+    fn dns_persist_rdata_exactly_255_bytes_no_split() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+
+        // "authority.example; accounturi=" = 30 chars
+        // We want exactly 255 total, so path should be 255 - 30 = 225 chars
+        let path = "x".repeat(225);
+        let account_uri = path.to_owned();
+        let expected_len = "authority.example; accounturi=".len() + path.len();
+        assert_eq!(expected_len, 255);
+
+        let record = DnsPersist01RecordBuilder::new(
+            &account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        // Should be a single chunk of exactly 255 bytes
+        assert_eq!(record.rdata().len(), 1);
+        assert_eq!(record.rdata()[0].len(), 255);
+    }
+
+    #[test]
+    fn dns_persist_rdata_256_bytes_splits() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+
+        // "authority.example; accounturi=" = 30 chars
+        // We want 256 total, so path should be 256 - 30 = 226 chars
+        let path = "x".repeat(226);
+        let account_uri = path.to_owned();
+        let expected_len = "authority.example; accounturi=".len() + path.len();
+        assert_eq!(expected_len, 256);
+
+        let record = DnsPersist01RecordBuilder::new(
+            &account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        // Should be split into 2 chunks
+        assert_eq!(record.rdata().len(), 2);
+        assert_eq!(record.rdata()[0].len(), 255);
+        assert_eq!(record.rdata()[1].len(), 1);
+    }
+
+    #[test]
+    fn dns_persist_dns_zone_record_single_chunk() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        let account_uri = "https://ca.example/acct/123";
+
+        let record = DnsPersist01RecordBuilder::new(
+            account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        let zone_record = record.dns_zone_record();
+        assert_eq!(
+            zone_record,
+            "_validation-persist.example.com. IN TXT \"authority.example; accounturi=https://ca.example/acct/123\""
+        );
+    }
+
+    #[test]
+    fn dns_persist_dns_zone_record_multi_chunk() {
+        let identifier = Identifier::Dns("example.com".into());
+        let challenge = make_challenge(vec!["authority.example"]);
+        let issuer: IssuerDomainName = "authority.example".parse().unwrap();
+        // Create a long account URI that will exceed 255 octets
+        let long_path = "a".repeat(300);
+        let account_uri = format!("https://ca.example/acct/{long_path}");
+
+        let record = DnsPersist01RecordBuilder::new(
+            &account_uri,
+            &issuer,
+            &challenge,
+            identifier.authorized(false),
+        )
+        .unwrap()
+        .build();
+
+        let zone_record = record.dns_zone_record();
+
+        // Should have parentheses for multi-string format
+        assert!(zone_record.starts_with("_validation-persist.example.com. IN TXT (\""));
+        assert!(zone_record.ends_with("\")"));
+        // Should have multiple quoted strings
+        assert!(zone_record.contains("\"\n \""));
     }
 }

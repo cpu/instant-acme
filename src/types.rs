@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::net::IpAddr;
+use std::slice::Iter;
+use std::str::FromStr;
 use std::time::Instant;
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
@@ -43,6 +45,9 @@ pub enum Error {
     #[cfg(feature = "hyper-rustls")]
     #[error("HTTP request failure: {0}")]
     Hyper(#[from] hyper::Error),
+    /// Invalid DNS-persist-01 challenge type issuer domains
+    #[error("DNS-persist-01 challenge issuer domain names invalid: {0}")]
+    InvalidIssuerDomains(String),
     /// Invalid ACME server URL
     #[error("invalid URI: {0}")]
     InvalidUri(#[from] http::uri::InvalidUri),
@@ -658,7 +663,7 @@ impl Identifier {
 
 /// An [`Identifier`] which knows its `wildcard` context
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct AuthorizedIdentifier<'a> {
     /// The source identifier, missing any wildcard context
     pub identifier: &'a Identifier,
@@ -699,42 +704,91 @@ pub struct Challenge {
     pub error: Option<Problem>,
 }
 
-impl Challenge {
-    /// Get the token for this challenge, if it has one
-    pub fn token(&self) -> Option<&str> {
-        match &self.state {
-            ChallengeState::Http01 { token }
-            | ChallengeState::Dns01 { token }
-            | ChallengeState::TlsAlpn01 { token } => Some(token),
-            ChallengeState::DeviceAttest01 | ChallengeState::Unknown { .. } => None,
-        }
-    }
+/// Challenge state for http-01 challenges
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Http01Challenge {
+    /// The token for this challenge
+    pub token: String,
 }
 
+/// Challenge state for dns-01 challenges
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct Dns01Challenge {
+    /// The token for this challenge
+    pub token: String,
+}
+
+/// Challenge state for tls-alpn-01 challenges
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct TlsAlpn01Challenge {
+    /// The token for this challenge
+    pub token: String,
+}
+
+/// Challenge state for dns-persist-01 challenges
+///
+/// Note: DNS persist challenge support is experimental
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DnsPersist01Challenge {
+    /// The list of issuer domain names accepted by the CA
+    pub issuer_domain_names: IssuerDomainNames,
+}
+
+/// The state of an ACME challenge
 #[allow(missing_docs)]
-#[derive(Debug, Deserialize, Eq, PartialEq)]
-#[serde(tag = "type")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChallengeState {
-    #[serde(rename = "http-01")]
-    Http01 { token: String },
-    #[serde(rename = "dns-01")]
-    Dns01 { token: String },
-    #[serde(rename = "tls-alpn-01")]
-    TlsAlpn01 { token: String },
+    Http01(Http01Challenge),
+    Dns01(Dns01Challenge),
+    /// Note: DNS persist challenge support is experimental
+    DnsPersist01(DnsPersist01Challenge),
+    TlsAlpn01(TlsAlpn01Challenge),
     /// Note: Device attestation support is experimental
-    #[serde(rename = "device-attest-01")]
     DeviceAttest01,
-    #[serde(untagged)]
-    Unknown { r#type: String },
+    Unknown {
+        r#type: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for ChallengeState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        let type_str = value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| de::Error::missing_field("type"))?;
+
+        match type_str {
+            "http-01" => serde_json::from_value(value)
+                .map(Self::Http01)
+                .map_err(de::Error::custom),
+            "dns-01" => serde_json::from_value(value)
+                .map(Self::Dns01)
+                .map_err(de::Error::custom),
+            "tls-alpn-01" => serde_json::from_value(value)
+                .map(Self::TlsAlpn01)
+                .map_err(de::Error::custom),
+            "dns-persist-01" => serde_json::from_value(value)
+                .map(Self::DnsPersist01)
+                .map_err(de::Error::custom),
+            "device-attest-01" => Ok(Self::DeviceAttest01),
+            other => Ok(Self::Unknown {
+                r#type: other.to_owned(),
+            }),
+        }
+    }
 }
 
 impl ChallengeState {
     /// Get the type of this challenge
     pub fn r#type(&self) -> ChallengeType {
         match self {
-            Self::Http01 { .. } => ChallengeType::Http01,
-            Self::Dns01 { .. } => ChallengeType::Dns01,
-            Self::TlsAlpn01 { .. } => ChallengeType::TlsAlpn01,
+            Self::Http01(_) => ChallengeType::Http01,
+            Self::Dns01(_) => ChallengeType::Dns01,
+            Self::DnsPersist01(_) => ChallengeType::DnsPersist01,
+            Self::TlsAlpn01(_) => ChallengeType::TlsAlpn01,
             Self::DeviceAttest01 => ChallengeType::DeviceAttest01,
             Self::Unknown { r#type } => ChallengeType::Unknown(r#type.clone()),
         }
@@ -750,6 +804,8 @@ pub enum ChallengeType {
     Http01,
     #[serde(rename = "dns-01")]
     Dns01,
+    #[serde(rename = "dns-persist-01")]
+    DnsPersist01,
     #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
     /// Note: Device attestation support is experimental
@@ -757,6 +813,150 @@ pub enum ChallengeType {
     DeviceAttest01,
     #[serde(untagged)]
     Unknown(String),
+}
+
+/// Issuer names for a [`ChallengeType::DnsPersist01`] challenge.
+///
+/// One or more (to a limit of 10) normalized issuer domain names provided
+/// by the ACME server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerDomainNames(Vec<IssuerDomainName>);
+
+impl IssuerDomainNames {
+    /// Servers MUST NOT send more than 10 issuer domain names.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-00#section-3.1>
+    pub const MAX_COUNT: usize = 10;
+
+    /// Create a new `IssuerDomainNames` collection.
+    ///
+    /// Returns an error if the collection is empty or contains more than
+    /// [`Self::MAX_COUNT`] elements.
+    pub fn new(names: Vec<IssuerDomainName>) -> Result<Self, Error> {
+        if names.is_empty() {
+            return Err(Error::InvalidIssuerDomains(
+                "no issuer domains provided".to_owned(),
+            ));
+        }
+        if names.len() > Self::MAX_COUNT {
+            return Err(Error::InvalidIssuerDomains(format!(
+                "too many issuer domains provided: {sent} > {max}",
+                sent = names.len(),
+                max = Self::MAX_COUNT
+            )));
+        }
+        Ok(Self(names))
+    }
+
+    /// Returns the number of issuer domain names
+    #[allow(clippy::len_without_is_empty)] // Type system ensures it is never empty.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns an iterator over the issuer domain names
+    pub fn iter(&self) -> impl Iterator<Item = &IssuerDomainName> {
+        self.0.iter()
+    }
+}
+
+impl AsRef<[IssuerDomainName]> for IssuerDomainNames {
+    fn as_ref(&self) -> &[IssuerDomainName] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a IssuerDomainNames {
+    type Item = &'a IssuerDomainName;
+    type IntoIter = Iter<'a, IssuerDomainName>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for IssuerDomainNames {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<IssuerDomainName>::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+/// A normalized issuer name for a [`ChallengeType::DnsPersist01`] challenge.
+///
+/// Each issuer name is an A-label format (e.g. ASCII-only), all lowercase,
+/// domain name that is no longer than 253 octets and has no trailing dot.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct IssuerDomainName(String);
+
+impl IssuerDomainName {
+    /// Each domain name MUST NOT exceed 253 octets in length.
+    ///
+    /// See <https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-00#section-3.1>
+    pub const MAX_LEN: usize = 253;
+
+    /// Create a new `IssuerDomainName` from a string.
+    ///
+    /// Returns an error if the string does not conform to the normalization
+    /// requirements.
+    pub fn new(s: &str) -> Result<Self, Error> {
+        if s.len() > Self::MAX_LEN {
+            return Err(Error::InvalidIssuerDomains(format!(
+                "issuer name was too long: {len} > {max}",
+                len = s.len(),
+                max = Self::MAX_LEN
+            )));
+        }
+
+        if s.is_empty() {
+            return Err(Error::InvalidIssuerDomains(
+                "issuer name was empty".to_owned(),
+            ));
+        }
+
+        // The domain name MUST NOT have a trailing dot.
+        if s.ends_with('.') {
+            return Err(Error::InvalidIssuerDomains(
+                "issuer name had a trailing dot".to_owned(),
+            ));
+        }
+
+        for byte in s.bytes() {
+            // The domain name MUST be represented in A-label format.
+            if !byte.is_ascii() {
+                return Err(Error::InvalidIssuerDomains(
+                    "issuer name was not in A-label format".to_owned(),
+                ));
+            }
+            // All characters MUST be lowercase.
+            if byte.is_ascii_uppercase() {
+                return Err(Error::InvalidIssuerDomains(
+                    "issuer name was not all lowercase".to_owned(),
+                ));
+            }
+        }
+
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl AsRef<str> for IssuerDomainName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for IssuerDomainName {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for IssuerDomainName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(&String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
 }
 
 /// Status of an ACME [Challenge]
@@ -1091,9 +1291,9 @@ mod tests {
         let obj = serde_json::from_str::<Challenge>(CHALLENGE).unwrap();
         assert_eq!(
             obj.state,
-            ChallengeState::Dns01 {
+            ChallengeState::Dns01(Dns01Challenge {
                 token: "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA".to_owned()
-            }
+            })
         );
         assert_eq!(obj.state.r#type(), ChallengeType::Dns01);
         assert_eq!(obj.url, "https://example.com/acme/chall/Rg5dV14Gh1Q");
@@ -1282,5 +1482,83 @@ mod tests {
         let window = info.suggested_window;
         assert_eq!(window.start.day(), 2);
         assert_eq!(window.end.day(), 3);
+    }
+
+    #[test]
+    fn valid_issuer_domains() {
+        let names = IssuerDomainNames::new(vec!["authority.example".parse().unwrap()]).unwrap();
+        assert_eq!(names.len(), 1);
+
+        let names = IssuerDomainNames::new(
+            (0..10)
+                .map(|i| format!("ca{i}.example").parse().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(names.len(), 10);
+    }
+
+    #[test]
+    fn invalid_issuer_domains() {
+        assert!(
+            IssuerDomainNames::new(vec![])
+                .unwrap_err()
+                .to_string()
+                .contains("no issuer domains")
+        );
+
+        assert!(
+            IssuerDomainNames::new(
+                (0..IssuerDomainNames::MAX_COUNT + 1)
+                    .map(|i| format!("ca{i}.example").parse().unwrap())
+                    .collect::<Vec<_>>()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("too many")
+        );
+    }
+
+    #[test]
+    fn dns_persist_challenge_valid_deserialization() {
+        // <https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-00#section-3.1>
+        const CHALLENGE: &str = r#"{
+              "type": "dns-persist-01",
+              "url": "https://ca.example/acme/authz/1234/0",
+              "status": "pending",
+              "issuer-domain-names": ["authority.example", "ca.example.net"]
+            }"#;
+
+        let obj = serde_json::from_str::<Challenge>(CHALLENGE).unwrap();
+        assert_eq!(obj.status, ChallengeStatus::Pending);
+        assert_eq!(obj.state.r#type(), ChallengeType::DnsPersist01);
+        assert_eq!(obj.url, "https://ca.example/acme/authz/1234/0");
+
+        let ChallengeState::DnsPersist01(challenge) = &obj.state else {
+            panic!("unexpected challenge state");
+        };
+
+        assert_eq!(challenge.issuer_domain_names.len(), 2);
+        assert_eq!(
+            challenge.issuer_domain_names.as_ref()[0].as_ref(),
+            "authority.example"
+        );
+        assert_eq!(
+            challenge.issuer_domain_names.as_ref()[1].as_ref(),
+            "ca.example.net"
+        );
+    }
+
+    #[test]
+    fn dns_persist_challenge_invalid_deserialization() {
+        const CHALLENGE: &str = r#"{
+              "type": "dns-persist-01",
+              "url": "https://ca.example/acme/authz/1234/0",
+              "status": "pending",
+              "issuer-domain-names": ["a.ex","b.ex","c.ex","d.ex","e.ex","f.ex","g.ex","h.ex","i.ex","j.ex","k.ex"]
+            }"#;
+
+        let err = serde_json::from_str::<Challenge>(CHALLENGE).unwrap_err();
+        assert!(err.to_string().contains("too many"), "error was: {err}");
     }
 }
