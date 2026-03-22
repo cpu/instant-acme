@@ -25,6 +25,7 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use instant_acme::challenges::dns_persist01;
 use instant_acme::{
     Account, AuthorizationHandle, AuthorizationStatus, BodyWrapper, CryptoProvider, Error,
     ExternalAccountKey, Identifier, Key, NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
@@ -79,6 +80,339 @@ async fn dns_01() -> Result<(), Box<dyn StdError>> {
         ])))
         .await
         .map(|_| ())
+}
+
+/// Test provisioning a dns-persist-01 record before creating an order
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_pre_provisioned() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    const IDENTIFIER: &str = "pre-provisioned.example.com";
+    const ISSUER: &str = "pebble.letsencrypt.org";
+
+    let mut config = EnvironmentConfig {
+        authz_reuse: 0,
+        ..EnvironmentConfig::default()
+    };
+    config.pebble.caa_identities = vec![ISSUER.to_owned()];
+    let env = Environment::new(config).await?;
+
+    let issuer = dns_persist01::IssuerDomainName::new(ISSUER)?;
+    let record = dns_persist01::RecordBuilder::new(env.account.id(), IDENTIFIER, &issuer)?.build();
+    set_txt(&env, record.hostname(), record.rdata()).await?;
+
+    // Only create the order after its persistent validation record is in place.
+    let identifiers = dns_identifiers([IDENTIFIER]);
+    let new_order = NewOrder::new(&identifiers);
+    let mut order = env.account.new_order(&new_order).await?;
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        assert_eq!(authz.status, AuthorizationStatus::Pending);
+
+        let mut challenge = authz
+            .dns_persist01()
+            .ok_or("no dns-persist-01 challenge found")?;
+        assert!(
+            challenge
+                .issuer_domain_names()
+                .iter()
+                .any(|candidate| candidate == &issuer),
+            "pre-provisioned issuer was not offered by the CA"
+        );
+        challenge.set_ready().await?;
+    }
+
+    let status = order.poll_ready(&RETRY_POLICY).await?;
+    assert_eq!(status, OrderStatus::Ready);
+    let _certificate = env.certificate(&mut order).await?;
+
+    Ok(())
+}
+
+/// Test dns-persist-01 challenge persistence behavior
+///
+/// This test verifies that a dns-persist-01 TXT record can be reused across multiple
+/// certificate issuances without re-provisioning, demonstrating the "persistence" aspect
+/// of the challenge type.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+    dns_persist_01_test(DnsPersist01TestConfig {
+        first_identifier: "dns-persist01.example.com",
+        second_identifier: "dns-persist01.example.com",
+        ..Default::default()
+    })
+    .await
+}
+
+/// Test dns-persist-01 wildcard policy behavior
+///
+/// This test verifies that a dns-persist-01 TXT record with the wildcard policy set
+/// can be used to issue wildcard certificates for the validated domain without
+/// re-provisioning.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_wildcard() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+    // First validate dns-persist01.example.com with wildcard policy,
+    // then issue for *.dns-persist01.example.com using the same TXT record.
+    dns_persist_01_test(DnsPersist01TestConfig {
+        first_identifier: "dns-persist01.example.com",
+        second_identifier: "*.dns-persist01.example.com",
+        wildcard_policy: true,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Test dns-persist-01 with long RDATA that requires multiple TXT character-strings
+///
+/// DNS TXT record strings have a 255 byte limit. This test verifies that the library
+/// exposes compliant chunks while preserving the complete logical RDATA.
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_long_rdata() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    // Create a long issuer domain name that will cause the RDATA to exceed 255 bytes.
+    // Format: "{issuer}; accounturi={account_uri}" where account_uri is ~60 chars.
+    // We need issuer + ~75 chars overhead > 255, so issuer should be > 180 chars.
+    let long_issuer = format!(
+        "{}.{}.{}.long-issuer.example",
+        "a".repeat(60),
+        "b".repeat(60),
+        "c".repeat(60)
+    );
+    assert!(long_issuer.len() > 180, "issuer should be long enough");
+
+    dns_persist_01_test(DnsPersist01TestConfig {
+        first_identifier: "long-rdata.example.com",
+        second_identifier: "long-rdata.example.com",
+        caa_identities: vec![long_issuer],
+        assert_multiple_rdata_chunks: true,
+        ..Default::default()
+    })
+    .await
+}
+
+/// Test dns-persist-01 persistUntil expiration behavior
+///
+/// This test verifies that a dns-persist-01 TXT record with an expired `persistUntil`
+/// timestamp is correctly rejected by the CA. The test:
+/// 1. Issues a certificate with a short persistUntil (2 seconds in the future)
+/// 2. Waits for the persistUntil to expire (3 seconds)
+/// 3. Attempts to issue again without re-provisioning, which should fail
+#[tokio::test]
+#[ignore]
+async fn dns_persist_01_expired() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    dns_persist_01_test(DnsPersist01TestConfig {
+        // Use wildcard to test that codepath as well
+        first_identifier: "persist-expired.example.com",
+        second_identifier: "*.persist-expired.example.com",
+        wildcard_policy: true,
+        // Disable random validation delays for predictable timing
+        va_nosleep: true,
+        // Set persistUntil to 2 seconds in the future - enough for first order to complete
+        persist_until_offset: Some(Duration::from_secs(2)),
+        // Sleep 3 seconds to ensure persistUntil has expired after first order completes
+        sleep_before_second_order: Some(Duration::from_secs(3)),
+        // Expect failure with persistUntil violation message
+        expect_failure_containing: Some("persistUntil"),
+        ..Default::default()
+    })
+    .await
+}
+
+/// Configuration for dns-persist-01 persistence tests
+#[derive(Default)]
+struct DnsPersist01TestConfig {
+    /// The identifier to use for the first order (provisions the TXT record)
+    first_identifier: &'static str,
+    /// The identifier to use for the second order (reuses the TXT record)
+    second_identifier: &'static str,
+    /// Whether to set the wildcard policy flag on the TXT record
+    wildcard_policy: bool,
+    /// Custom CAA identities (issuer domain names) for the Pebble config
+    caa_identities: Vec<String>,
+    /// Assert that the RDATA requires multiple TXT character-strings
+    assert_multiple_rdata_chunks: bool,
+    /// Set persistUntil to now + this duration (if Some)
+    persist_until_offset: Option<Duration>,
+    /// Sleep this duration before creating the second order
+    sleep_before_second_order: Option<Duration>,
+    /// If set, expect the second order to fail with an error containing this text
+    expect_failure_containing: Option<&'static str>,
+    /// Disable random sleep delays before Pebble validation attempts
+    va_nosleep: bool,
+}
+
+/// Common test logic for dns-persist-01 persistence tests
+async fn dns_persist_01_test(config: DnsPersist01TestConfig) -> Result<(), Box<dyn StdError>> {
+    // Disable authz reuse to ensure we're testing dns-persist-01 persistence,
+    // not ACME server-side authorization reuse.
+    let mut env_config = EnvironmentConfig {
+        authz_reuse: 0,
+        va_nosleep: config.va_nosleep,
+        ..EnvironmentConfig::default()
+    };
+    env_config.pebble.caa_identities = config.caa_identities;
+    let env = Environment::new(env_config).await?;
+
+    let first_identifiers = dns_identifiers([config.first_identifier]);
+    let first_order = NewOrder::new(&first_identifiers);
+
+    // First issuance: provision the TXT record and complete the challenge.
+    debug!("creating first order");
+    let mut order = env.account.new_order(&first_order).await?;
+    info!(order_url = order.url(), "created first order");
+
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+        assert_eq!(
+            authz.status,
+            AuthorizationStatus::Pending,
+            "first order authz should be pending"
+        );
+
+        let mut dns_chall = authz
+            .dns_persist01()
+            .ok_or("no dns-persist-01 challenge found")?;
+
+        // Build the TXT record with the first issuer
+        let issuer = dns_chall.issuer_domain_names().first();
+
+        let mut builder = dns_chall.response_txt_record(issuer)?;
+        if config.wildcard_policy {
+            builder = builder.wildcard();
+        }
+        if let Some(offset) = config.persist_until_offset {
+            let persist_until = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + offset.as_secs();
+            builder = builder.persist_until(persist_until);
+        }
+        let record = builder.build();
+
+        // Verify lazy character-string chunking without changing the logical RDATA.
+        if config.assert_multiple_rdata_chunks {
+            assert!(
+                record.rdata_chunks().len() > 1,
+                "expected RDATA to be split into multiple chunks, got {} chunk(s)",
+                record.rdata_chunks().len()
+            );
+            assert!(record.rdata_chunks().all(|chunk| chunk.len() <= 255));
+            assert_eq!(record.rdata_chunks().collect::<String>(), record.rdata());
+        }
+
+        let host = record.hostname();
+        let value = record.rdata();
+        debug!(
+            host,
+            value,
+            rdata_chunks = record.rdata_chunks().len(),
+            wildcard_policy = config.wildcard_policy,
+            "provisioning dns-persist-01 response for first order"
+        );
+
+        set_txt(&env, host, value).await?;
+
+        debug!("marking first order challenge ready");
+        dns_chall.set_ready().await?;
+    }
+
+    // Poll until the first order is ready and issue the certificate
+    let status = order.poll_ready(&RETRY_POLICY).await?;
+    assert_eq!(status, OrderStatus::Ready, "first order should be ready");
+    let _first_cert = env.certificate(&mut order).await?;
+    info!("first certificate issued successfully");
+
+    // Optional sleep before second order (e.g., to let persistUntil expire)
+    if let Some(sleep_duration) = config.sleep_before_second_order {
+        debug!(?sleep_duration, "sleeping before second order");
+        sleep(sleep_duration).await;
+    }
+
+    // Second issuance: reuse the same TXT record without re-provisioning
+    let second_identifiers = dns_identifiers([config.second_identifier]);
+    let second_order = NewOrder::new(&second_identifiers);
+
+    debug!(config.second_identifier, "creating second order");
+    let mut order = env.account.new_order(&second_order).await?;
+    info!(order_url = order.url(), "created second order");
+
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result?;
+
+        // The authz should be PENDING, not VALID (which would indicate server-side reuse)
+        assert_eq!(
+            authz.status,
+            AuthorizationStatus::Pending,
+            "second order authz should be pending (not reused by server)"
+        );
+
+        let mut dns_chall = authz
+            .dns_persist01()
+            .ok_or("no dns-persist-01 challenge found in second order")?;
+
+        // Do NOT re-provision the TXT record - the persistence mechanism means
+        // the previous record should still be valid for this new challenge.
+        debug!("marking second order challenge ready WITHOUT re-provisioning TXT record");
+        dns_chall.set_ready().await?;
+    }
+
+    // Poll until the second order is ready
+    let poll_result = order.poll_ready(&RETRY_POLICY).await;
+
+    // Handle expected failure case
+    if let Some(expected_error) = config.expect_failure_containing {
+        let err = poll_result.expect_err("expected second order to fail");
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains(expected_error),
+            "expected error containing {expected_error:?}, got: {err_string}"
+        );
+        info!("second order failed as expected with persistUntil violation");
+        return Ok(());
+    }
+
+    // Normal success case
+    let status = poll_result?;
+    assert_eq!(status, OrderStatus::Ready, "second order should be ready");
+    let _second_cert = env.certificate(&mut order).await?;
+    info!("second certificate issued successfully using persisted TXT record");
+
+    Ok(())
+}
+
+async fn set_txt(env: &Environment, host: &str, value: &str) -> Result<(), Box<dyn StdError>> {
+    #[derive(Serialize)]
+    struct SetTxtRequest<'a> {
+        host: &'a str,
+        value: &'a str,
+    }
+
+    let body = serde_json::to_vec(&SetTxtRequest { host, value })?;
+    let url = format!("http://[::1]:{}/set-txt", env.config.challtestsrv_port);
+    env.client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(BodyWrapper::from(body))?,
+        )
+        .await?;
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -578,15 +912,18 @@ impl Environment {
 
         debug!("starting Pebble CA environment");
 
-        let pebble = Subprocess::new(
-            Command::new(&pebble_path)
-                .env("PEBBLE_AUTHZREUSE", config.authz_reuse.to_string())
-                .arg("-config")
-                .arg(config_file.path())
-                .arg("-dnsserver")
-                .arg(format!("[::1]:{}", config.dns_port))
-                .arg("-strict"),
-        )?;
+        let mut pebble_cmd = Command::new(&pebble_path);
+        pebble_cmd
+            .env("PEBBLE_AUTHZREUSE", config.authz_reuse.to_string())
+            .arg("-config")
+            .arg(config_file.path())
+            .arg("-dnsserver")
+            .arg(format!("[::1]:{}", config.dns_port))
+            .arg("-strict");
+        if config.va_nosleep {
+            pebble_cmd.env("PEBBLE_VA_NOSLEEP", "1");
+        }
+        let pebble = Subprocess::new(&mut pebble_cmd)?;
 
         // Note: we bind `[::1]` for the challenge test server because by default it will
         //  return both A and AAAA records.
@@ -950,6 +1287,10 @@ struct EnvironmentConfig {
     ///
     /// See <https://github.com/letsencrypt/pebble?tab=readme-ov-file#valid-authorization-reuse>
     authz_reuse: u8,
+    /// Disable random sleep delays before validation attempts
+    ///
+    /// When true, sets `PEBBLE_VA_NOSLEEP=1` for the Pebble process.
+    va_nosleep: bool,
 }
 
 impl Default for EnvironmentConfig {
@@ -960,6 +1301,7 @@ impl Default for EnvironmentConfig {
             challtestsrv_port: NEXT_PORT.fetch_add(1, Ordering::SeqCst),
             eab_key: None,
             authz_reuse: 50,
+            va_nosleep: false,
         }
     }
 }
@@ -979,6 +1321,11 @@ struct PebbleConfig {
     domain_blocklist: Vec<&'static str>,
     retry_after: RetryConfig,
     profiles: HashMap<&'static str, Profile>,
+    /// CAA identities returned in dns-persist-01 challenges as issuerDomainNames
+    ///
+    /// Defaults to `["pebble.letsencrypt.org"]` if empty/unset.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    caa_identities: Vec<String>,
 }
 
 impl Default for PebbleConfig {
@@ -1018,6 +1365,7 @@ impl Default for PebbleConfig {
                 ),
             ]
             .into(),
+            caa_identities: Vec::new(),
         }
     }
 }

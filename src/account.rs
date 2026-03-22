@@ -332,7 +332,7 @@ impl Account {
 pub(crate) struct AccountInner {
     client: Arc<Client>,
     pub(crate) key: Key,
-    id: String,
+    pub(crate) id: String,
 }
 
 impl AccountInner {

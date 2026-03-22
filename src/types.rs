@@ -43,6 +43,9 @@ pub enum Error {
     #[cfg(feature = "hyper-rustls")]
     #[error("HTTP request failure: {0}")]
     Hyper(#[from] hyper::Error),
+    /// Invalid dns-persist-01 challenge type issuer domain(s)
+    #[error("dns-persist-01 challenge issuer domain name(s) invalid: {0}")]
+    InvalidIssuerDomains(String),
     /// Invalid ACME server URL
     #[error("invalid URI: {0}")]
     InvalidUri(#[from] http::uri::InvalidUri),
